@@ -1,4 +1,4 @@
-# MotionComp
+# Event tracker
 
 Event-camera-enhanced visual tracking for drone pursuit. Built for a bachelor's thesis on fusing Prophesee event cameras with standard RGB cameras to track fast-moving objects.
 
