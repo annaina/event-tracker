@@ -19,11 +19,12 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src
 )
 
-# -- MOSSE tracker with event-camera flow --
+# -- MOSSE tracker with event-camera flow + re-ID --
 add_executable(tracker
     src/tracker_main.cpp
     src/rgb_reader.cpp
     src/event.cpp
+    src/reidentifier.cpp
 )
 target_link_libraries(tracker
     ${OpenCV_LIBS}
@@ -39,6 +40,19 @@ add_executable(align
     src/event.cpp
 )
 target_link_libraries(align
+    ${OpenCV_LIBS}
+    Eigen3::Eigen
+    ${HDF5_LIBRARIES}
+    ${HDF5_CXX_LIBRARIES}
+)
+
+# -- Offline calibration tool --
+add_executable(calibrate
+    src/calibrate_main.cpp
+    src/rgb_reader.cpp
+    src/event.cpp
+)
+target_link_libraries(calibrate
     ${OpenCV_LIBS}
     Eigen3::Eigen
     ${HDF5_LIBRARIES}

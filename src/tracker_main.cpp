@@ -31,6 +31,8 @@
 
 #include "rgb_reader.h"
 #include "event.h"
+#include "reidentifier.h"
+#include "auto_calibrate.h"
 
 // ---------------------------------------------------------------------------
 //  Command-line arguments
@@ -39,6 +41,7 @@
 struct Args {
     std::string h5path;
     std::string side      = "left";
+    std::string calibPath;            // path to calibration.yaml
     double      startSec  = 0.0;
     double      duration  = -1.0;   // negative means play everything
 };
@@ -47,7 +50,8 @@ static Args parseArgs(int argc, char** argv) {
     Args a;
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <data.h5> [--side left|right] [--start S] [--duration S]\n";
+                  << " <data.h5> [--calib calibration.yaml]"
+                  << " [--side left|right] [--start S] [--duration S]\n";
         std::exit(1);
     }
     a.h5path = argv[1];
@@ -56,6 +60,7 @@ static Args parseArgs(int argc, char** argv) {
         if (arg == "--side" && i + 1 < argc) a.side = argv[++i];
         else if (arg == "--start" && i + 1 < argc) a.startSec = std::stod(argv[++i]);
         else if (arg == "--duration" && i + 1 < argc) a.duration = std::stod(argv[++i]);
+        else if (arg == "--calib" && i + 1 < argc) a.calibPath = argv[++i];
     }
     return a;
 }
@@ -417,32 +422,50 @@ int main(int argc, char** argv)
               << "  SPACE = pause / select bbox / start tracking\n"
               << "  R = reset   E = event overlay   T = trail\n"
               << "  +/- = event window   Q = quit\n"
+              << "  Kalman filter + template re-ID active\n"
               << "======================================================\n\n";
 
-    // -- Camera calibration (from the H5 intrinsics) --
+    // -- Load camera calibration --
     //
-    // The two cameras have different focal lengths and principal points,
-    // so a pixel at (u,v) in RGB-space doesn't map to (u,v) in event-space.
-    // We derive a simple affine transform from the intrinsics:
+    // The calibration maps event camera coords to RGB camera coords:
+    //   u_evt = sx * u_rgb + ox
+    //   v_evt = sy * v_rgb + oy
     //
-    //   u_evt = (fx_e / fx_r) * u_rgb + (cx_e - cx_r * fx_e/fx_r)
-    //   v_evt = (fy_e / fy_r) * v_rgb + (cy_e - cy_r * fy_e/fy_r)
-    //
-    // This ignores the ~3cm baseline parallax, which is negligible for
-    // objects more than a couple meters away.
+    // Run the `calibrate` tool on a recording to generate the .yaml file:
+    //   ./calibrate <data.h5> -o calibration.yaml
+    // Then pass it here with --calib.
 
-    double fx_e = 1034.86, fy_e = 1033.48, cx_e = 629.70, cy_e = 357.60;
-    double fx_r = 1268.56, fy_r = 1267.35, cx_r = 649.37, cy_r = 359.94;
+    double sr_x, sr_y, off_x, off_y;
 
-    double sr_x  = fx_e / fx_r;            // ~0.816
-    double sr_y  = fy_e / fy_r;
-    double off_x = cx_e - cx_r * sr_x;     // ~100 px
-    double off_y = cy_e - cy_r * sr_y;     // ~64 px
+    if (!args.calibPath.empty()) {
+        CalibResult cal;
+        if (!loadCalibration(args.calibPath, cal)) {
+            std::cerr << "Error: cannot load calibration file: " << args.calibPath << "\n";
+            return 1;
+        }
+        sr_x  = cal.sx;
+        sr_y  = cal.sy;
+        off_x = cal.ox;
+        off_y = cal.oy;
+        std::cout << "  Loaded calibration from: " << args.calibPath
+                  << "  (score=" << (int)(cal.score*100) << "%)\n";
+    } else {
+        // Fallback: hardcoded M3ED falcon intrinsics (only valid for that rig)
+        double fx_e = 1034.86, fy_e = 1033.48, cx_e = 629.70, cy_e = 357.60;
+        double fx_r = 1268.56, fy_r = 1267.35, cx_r = 649.37, cy_r = 359.94;
+        sr_x  = fx_e / fx_r;
+        sr_y  = fy_e / fy_r;
+        off_x = cx_e - cx_r * sr_x;
+        off_y = cy_e - cy_r * sr_y;
+        std::cout << "  WARNING: No calibration file loaded (use --calib).\n"
+                  << "  Falling back to hardcoded M3ED intrinsics.\n"
+                  << "  Run:  ./calibrate <data.h5> -o calibration.yaml\n";
+    }
 
-    double rs_x   = fx_r / fx_e;           // inverse scale
-    double rs_y   = fy_r / fy_e;
-    double roff_x = cx_r - cx_e * rs_x;    // inverse offset
-    double roff_y = cy_r - cy_e * rs_y;
+    double rs_x   = 1.0 / sr_x;
+    double rs_y   = 1.0 / sr_y;
+    double roff_x = -off_x / sr_x;
+    double roff_y = -off_y / sr_y;
 
     auto rgb2evt_x = [&](double u) { return sr_x * u + off_x; };
     auto rgb2evt_y = [&](double v) { return sr_y * v + off_y; };
@@ -473,6 +496,8 @@ int main(int argc, char** argv)
     cv::Rect2d bbox, evt_bbox;
     EventBBoxPredictor predictor(eventReader.width(), eventReader.height());
     BBoxTrail trail;
+    ReIdentifier reid;
+    bool reid_active = false;   // true while we're in "lost" recovery mode
 
     double event_density = 0, confidence = 0;
     double evtWindowMs = 5.0;
@@ -508,24 +533,52 @@ int main(int argc, char** argv)
         // -- Run tracker --
         if (mode == TRACKING) {
             bool mosse_ok = tracker->update(frame, bbox);
-            if (mosse_ok) {
-                // Convert the MOSSE bbox from RGB coords to event cam coords
-                cv::Rect2d evt_roi(
-                    rgb2evt_x(bbox.x), rgb2evt_y(bbox.y),
-                    bbox.width * sr_x, bbox.height * sr_y);
 
-                // Get event-based flow prediction
-                cv::Point2d shift = predictor.predict(events, evt_roi,
-                                                      event_density, confidence);
-                shift.x *= rs_x;    // scale back to RGB pixels
-                shift.y *= rs_y;
+            // Even if MOSSE says "ok", check for drift. MOSSE almost never
+            // reports failure — it just silently drifts onto background.
+            bool drifted = false;
+            if (mosse_ok) {
+                drifted = reid.hasDrifted(bbox, frame, frame.cols, frame.rows);
+            }
+
+            // Get event flow from the current bbox position
+            cv::Rect2d flow_bbox = (mosse_ok && !drifted) ? bbox : reid.predictedBBox();
+            cv::Rect2d evt_roi(
+                rgb2evt_x(flow_bbox.x), rgb2evt_y(flow_bbox.y),
+                flow_bbox.width * sr_x, flow_bbox.height * sr_y);
+            cv::Point2d shift = predictor.predict(events, evt_roi,
+                                                  event_density, confidence);
+            shift.x *= rs_x;
+            shift.y *= rs_y;
+
+            if (mosse_ok && !drifted) {
+                reid_active = false;
+
+                // Feed MOSSE + events into the Kalman filter / re-ID module
+                cv::Rect2d smoothed = reid.update(bbox, shift, confidence, frame);
+
+                // The Kalman-smoothed bbox fuses MOSSE + events. If MOSSE
+                // is drifting away from it, re-seat MOSSE on the Kalman
+                // position so it doesn't wander off into background.
+                double dx = (bbox.x + bbox.width/2) - (smoothed.x + smoothed.width/2);
+                double dy = (bbox.y + bbox.height/2) - (smoothed.y + smoothed.height/2);
+                double gap = std::sqrt(dx*dx + dy*dy);
+                if (gap > 15.0) {
+                    // MOSSE has drifted >15px from the Kalman estimate.
+                    // Re-seat it. This is gentle — it only fires when
+                    // there's real disagreement, not every frame.
+                    tracker = cv::legacy::TrackerMOSSE::create();
+                    tracker->init(frame, smoothed);
+                    bbox = smoothed;
+                }
 
                 evt_bbox = bbox;
                 evt_bbox.x += shift.x;
                 evt_bbox.y += shift.y;
 
-                // Draw MOSSE bbox (green)
+                // Draw MOSSE bbox (green) and Kalman-smoothed bbox (white)
                 cv::rectangle(display, bbox, {0,255,0}, 2);
+                cv::rectangle(display, smoothed, {255,255,255}, 1);
 
                 // Draw event-predicted bbox and flow arrow (cyan/yellow)
                 if (confidence > 0.15) {
@@ -540,7 +593,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // Confidence bar (top-right corner)
+                // Appearance + confidence bars (top-right corner)
                 int bw=100, bh=8, bx=display.cols-bw-10, by=10;
                 cv::rectangle(display, {bx,by,bw,bh}, {80,80,80}, -1);
                 int fill = (int)(confidence * bw);
@@ -549,12 +602,66 @@ int main(int argc, char** argv)
                 cv::putText(display, "evt conf", {bx, by+bh+14},
                             cv::FONT_HERSHEY_SIMPLEX, 0.4, {180,180,180}, 1);
 
+                // Appearance score bar
+                by += 30;
+                double app = reid.lastAppearanceScore();
+                cv::rectangle(display, {bx,by,bw,bh}, {80,80,80}, -1);
+                int afill = (int)(std::max(0.0, app) * bw);
+                cv::rectangle(display, {bx,by,afill,bh},
+                    app > 0.4 ? cv::Scalar(0,255,0) : cv::Scalar(0,0,255), -1);
+                cv::putText(display, "appear", {bx, by+bh+14},
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, {180,180,180}, 1);
+
                 trail.push(bbox);
             } else {
-                cv::putText(display, "MOSSE LOST", {10, display.rows-40},
-                            cv::FONT_HERSHEY_SIMPLEX, 0.65, {0,0,255}, 2);
-                if (confidence > 0.2)
-                    cv::rectangle(display, evt_bbox, {0,100,255}, 2);
+                // MOSSE lost or drifted — try to re-identify
+                reid_active = true;
+                cv::Rect2d recovered;
+
+                if (reid.recover(frame, recovered)) {
+                    // Re-ID found it! Re-init MOSSE at the recovered location.
+                    tracker = cv::legacy::TrackerMOSSE::create();
+                    bbox = recovered;
+                    evt_bbox = recovered;
+                    tracker->init(frame, bbox);
+                    reid_active = false;
+
+                    cv::rectangle(display, recovered, {255,165,0}, 2);
+                    cv::putText(display, "RE-ID OK", {10, display.rows-40},
+                                cv::FONT_HERSHEY_SIMPLEX, 0.65, {255,165,0}, 2);
+                    trail.push(recovered);
+                } else {
+                    // Still lost — show the Kalman prediction so the user
+                    // can see where we think the target went
+                    cv::Rect2d pred = reid.predictedBBox();
+                    cv::rectangle(display, pred, {0,100,255}, 1);
+
+                    char lostBuf[64];
+                    snprintf(lostBuf, sizeof(lostBuf), "LOST (%d frames)%s",
+                             reid.lostFrames(),
+                             drifted ? " [drift]" : "");
+                    cv::putText(display, lostBuf, {10, display.rows-40},
+                                cv::FONT_HERSHEY_SIMPLEX, 0.65, {0,0,255}, 2);
+
+                    // Draw the velocity arrow on the prediction
+                    cv::Point2d vel = reid.velocity();
+                    double vmag = std::sqrt(vel.x*vel.x + vel.y*vel.y);
+                    if (vmag > 0.5) {
+                        cv::Point2d pc(pred.x + pred.width/2, pred.y + pred.height/2);
+                        cv::Point2d vt(pc.x + vel.x * 5.0, pc.y + vel.y * 5.0);
+                        cv::arrowedLine(display, pc, vt, {0,100,255}, 2, cv::LINE_AA, 0, 0.3);
+                    }
+
+                    // If we've been lost too long, give up and reset
+                    if (reid.gaveUp()) {
+                        tracker.release();
+                        trail.clear();
+                        mode = PLAYING;
+                        event_density = confidence = 0;
+                        std::cout << "[Re-ID] Gave up after " << reid.lostFrames()
+                                  << " frames.\n";
+                    }
+                }
             }
         }
 
@@ -590,7 +697,11 @@ int main(int argc, char** argv)
         switch (mode) {
             case PLAYING:  mstr = "PLAYING"; break;
             case PAUSED:   mstr = "PAUSED - draw box, then SPACE"; break;
-            case TRACKING: mstr = "TRACKING (MOSSE + Events)"; break;
+            case TRACKING:
+                mstr = reid_active
+                    ? "SEARCHING (Re-ID + Kalman)"
+                    : "TRACKING (MOSSE + Events + Kalman)";
+                break;
         }
         drawHUD(display, mstr, event_density, confidence,
                 frameIdx, totalFrames, evtWindowMs, show_evt_overlay);
@@ -622,6 +733,8 @@ int main(int argc, char** argv)
                     bbox = cv::Rect2d(sel.roi);
                     evt_bbox = bbox;
                     tracker->init(frame, bbox);
+                    reid.init(bbox, frame);
+                    reid_active = false;
                     trail.clear();
                     mode = TRACKING;
                     std::cout << "Tracking started at frame " << frameIdx
@@ -633,6 +746,7 @@ int main(int argc, char** argv)
         if (key == 'r') {
             tracker.release(); trail.clear(); mode = PLAYING;
             event_density = confidence = 0;
+            reid_active = false;
             std::cout << "Tracker reset\n";
         }
         if (key == 'e') {
