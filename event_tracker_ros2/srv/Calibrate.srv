@@ -1,0 +1,17 @@
+# Run camera calibration (event ↔ RGB).
+# Request: path to H5 data, number of frames, search options.
+# Response: calibration result.
+
+string h5_path                  # path to the M3ED .h5 file
+string side                     # "left" or "right" event camera
+int32  num_frames               # how many frames to sample (default 20)
+bool   wide                     # wider search for unknown cameras
+string output_path              # where to save the .yaml result
+---
+bool    success
+string  message
+float64 sx
+float64 sy
+float64 ox
+float64 oy
+float64 score                   # edge overlap fraction (0-1)

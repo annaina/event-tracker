@@ -1,0 +1,20 @@
+# ──────────────────────────────────────────────────────────────
+#  H5 Event Publisher Parameters
+# ──────────────────────────────────────────────────────────────
+
+h5_event_publisher:
+  ros__parameters:
+    # Path to the M3ED .h5 data file
+    h5_path: ""
+
+    # Event camera side: "left" or "right"
+    side: "left"
+
+    # Start time offset in seconds (0 = beginning)
+    start_sec: 0.0
+
+    # Duration to publish (0 = full recording)
+    duration_sec: 0.0
+
+    # Event accumulation window in milliseconds
+    event_window_ms: 10.0

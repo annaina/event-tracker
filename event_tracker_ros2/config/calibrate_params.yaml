@@ -1,0 +1,26 @@
+# ──────────────────────────────────────────────────────────────
+#  Calibrate Node Parameters
+# ──────────────────────────────────────────────────────────────
+
+calibrate_node:
+  ros__parameters:
+    # Path to the M3ED .h5 data file
+    h5_path: ""
+
+    # Output calibration YAML path
+    output_path: "calibration.yaml"
+
+    # Event camera side: "left" or "right"
+    side: "left"
+
+    # Number of frames to sample for calibration
+    num_frames: 20
+
+    # Wide search mode (for unknown camera pairs)
+    wide: false
+
+    # Show visual preview after calibration
+    preview: false
+
+    # Run calibration immediately on startup
+    run_on_start: true

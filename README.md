@@ -138,6 +138,54 @@ Use this if you want to visually inspect and manually tune the camera alignment.
 ./align <data.h5> [--side left|right] [--time <seconds>]
 ```
 
+## ROS 2 Humble package
+
+A full ROS 2 Humble translation lives in `event_tracker_ros2/`. Same tracking logic, clean ROS 2 architecture with topics, services, custom messages, launch files, and config YAML.
+
+### Building (ROS 2)
+
+```bash
+# Source ROS 2 Humble
+source /opt/ros/humble/setup.bash
+
+# Build the package
+cd event_tracker_ros2
+colcon build --packages-select event_tracker
+source install/setup.bash
+```
+
+### Running (ROS 2)
+
+```bash
+# Full tracker pipeline (H5 publisher + tracker node)
+ros2 launch event_tracker tracker.launch.py \
+    h5_path:=/path/to/falcon_indoor_flight_1_data.h5
+
+# Calibration
+ros2 launch event_tracker calibrate.launch.py \
+    h5_path:=/path/to/falcon_indoor_flight_1_data.h5
+
+# Interactive alignment tool
+ros2 launch event_tracker align.launch.py \
+    h5_path:=/path/to/falcon_indoor_flight_1_data.h5
+```
+
+### ROS 2 nodes
+
+| Node | Topics / Services |
+|------|-------------------|
+| `h5_event_publisher` | Publishes `~/events` (EventArray) and `~/image_raw` (Image) from H5 file |
+| `tracker_node` | Subscribes to image + events, publishes `~/tracking_status`, `~/debug_image`, `~/time_surface` |
+| `calibrate_node` | Service `~/calibrate` (Calibrate.srv) — run calibration on demand |
+| `align_node` | Interactive GUI for camera alignment |
+
+### Custom messages
+
+- `Event.msg` — single event (stamp, x, y, polarity)
+- `EventArray.msg` — batch of events with header
+- `TrackingStatus.msg` — tracker state, bbox, confidence, flow
+- `Calibrate.srv` — request calibration, get sx/sy/ox/oy back
+
 ## Project structure
 
 ```
@@ -149,6 +197,12 @@ src/
   reidentifier.h/.cpp   Kalman filter + template gallery re-ID module
   event.h / event.cpp   Event data types + H5 reader
   rgb_reader.h / .cpp   RGB frame reader (from H5)
+event_tracker_ros2/     ROS 2 Humble package (same logic, ROS architecture)
+  src/                  Node executables + core library
+  include/              Headers
+  msg/ srv/             Custom messages and services
+  launch/               Launch files
+  config/               Parameter YAML files
 data/
   *.h5                  M3ED dataset files
 build/

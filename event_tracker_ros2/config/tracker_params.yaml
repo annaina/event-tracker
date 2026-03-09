@@ -1,0 +1,21 @@
+# ──────────────────────────────────────────────────────────────
+#  Tracker Node Parameters
+# ──────────────────────────────────────────────────────────────
+
+tracker_node:
+  ros__parameters:
+    # Path to calibration YAML (event ↔ RGB transform).
+    # Leave empty to use the M3ED fallback intrinsics.
+    calib_path: ""
+
+    # Event accumulation window in milliseconds.
+    event_window_ms: 10.0
+
+    # MOSSE ↔ Kalman reseat threshold (pixels).
+    # If MOSSE drifts further than this from Kalman, we re-init MOSSE.
+    reseat_threshold: 15.0
+
+    # Display options (only used when gui=true)
+    gui: true
+    show_overlay: true
+    show_trail: true
