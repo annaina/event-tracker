@@ -2,14 +2,17 @@
 
 Event-camera-enhanced visual tracking for drone pursuit. Built for a bachelor's thesis on fusing Prophesee event cameras with standard RGB cameras to track fast-moving objects.
 
+Combines a MOSSE correlation-filter tracker with event-based optical flow, a Kalman filter, and template-based re-identification so the tracker can follow fast, erratic targets (like drones) through occlusions, blur, and temporary loss.
+
 ## What's in here
 
-Two tools that read from M3ED HDF5 data files:
+Three tools that read from M3ED HDF5 data files:
 
 | Binary | What it does |
 |--------|-------------|
-| `tracker` | **MOSSE tracker + event-camera flow.** Runs a MOSSE correlation-filter tracker on RGB frames and uses event-based optical flow to predict motion between frames. |
-| `align` | **Camera alignment tool.** Finds the affine mapping between the event camera and RGB camera by maximizing edge overlap. Run this first if the cameras aren't lined up. |
+| `tracker` | **MOSSE tracker + event flow + re-ID.** Tracks a user-selected target using MOSSE on RGB frames, event-camera optical flow for inter-frame prediction, a Kalman filter for smoothing, and template-based re-identification for recovery after loss. |
+| `calibrate` | **Offline camera calibration.** Finds the scale + offset mapping between the event camera and RGB camera by maximizing edge overlap across multiple frames. Saves the result to a YAML file for the tracker to load. |
+| `align` | **Interactive alignment tool.** Visual tool for manually inspecting and fine-tuning the event-to-RGB camera mapping with live sliders and overlay. |
 
 ## Data
 
@@ -27,26 +30,58 @@ cmake ..
 make -j$(nproc)
 ```
 
-Or build individually:
+Or build individual targets:
 
 ```bash
 make tracker
+make calibrate
 make align
 ```
 
-## Running
+## Quick start
 
 HDF5 with LZF compression needs the lzf library preloaded:
 
 ```bash
-# Tracker
-LD_PRELOAD=/lib/x86_64-linux-gnu/liblzf.so ./build/tracker data/falcon_indoor_flight_1_data.h5
+# 1. Calibrate the cameras (run once per dataset)
+LD_PRELOAD=/lib/x86_64-linux-gnu/liblzf.so \
+  ./build/calibrate data/falcon_indoor_flight_1_data.h5 -o calibration.yaml
 
-# Alignment tool
-LD_PRELOAD=/lib/x86_64-linux-gnu/liblzf.so ./build/align data/falcon_indoor_flight_1_data.h5
+# 2. Run the tracker
+LD_PRELOAD=/lib/x86_64-linux-gnu/liblzf.so \
+  ./build/tracker data/falcon_indoor_flight_1_data.h5 --calib calibration.yaml
 ```
 
-### Tracker usage
+## Calibration
+
+The event camera and RGB camera have different intrinsics, so we need a scale + offset transform to map between them:
+
+```
+u_evt = sx * u_rgb + ox
+v_evt = sy * v_rgb + oy
+```
+
+The `calibrate` tool finds these four parameters automatically by running a multi-pass grid search that maximizes edge overlap between Canny edges from the RGB frame and dilated event edges.
+
+**Usage:**
+```
+./calibrate <data.h5> [-o calibration.yaml] [--side left|right]
+                      [--frames 20] [--wide] [--preview]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-o <path>` | Output YAML file (default: print to stdout) |
+| `--frames N` | Number of frames to sample (default: 20, more = slower but more robust) |
+| `--wide` | Use a wider search range for cameras with unknown intrinsics |
+| `--preview` | Show a visual overlay of the final alignment before saving |
+| `--side left\|right` | Which event camera to use (default: left) |
+
+The tracker loads the calibration file with `--calib`. If no calibration is provided, it falls back to hardcoded M3ED intrinsics with a warning.
+
+## Tracker
+
+### Usage
 
 1. Run the tracker — it starts playing the RGB video
 2. Press **SPACE** to pause
@@ -65,17 +100,35 @@ Two windows open: the left shows the RGB frame with the MOSSE bounding box (gree
 
 **Options:**
 ```
-./tracker <data.h5> [--side left|right] [--start <seconds>] [--duration <seconds>]
+./tracker <data.h5> [--calib calibration.yaml]
+                    [--side left|right] [--start <seconds>] [--duration <seconds>]
 ```
 
-### Alignment tool usage
+### How it works
 
-Use this if the event camera overlay doesn't line up with the RGB frame. It shows edge overlap between the two cameras and lets you search for the best transform.
+The tracking pipeline fuses three sources of information:
+
+1. **MOSSE correlation filter** — runs on each RGB frame (~25fps). Fast and accurate when the target is visible, but drifts on blur or occlusion.
+
+2. **Event-based optical flow** — between RGB frames, events from the Prophesee camera estimate motion inside the bounding box:
+   - A time-surface records when each pixel last fired
+   - A local plane fit on the 5×5 neighborhood gives the time-surface gradient
+   - Normal flow: $\mathbf{v} = -\nabla T / |\nabla T|^2$
+   - Per-event flows are averaged over the bbox and EMA-smoothed across frames
+
+3. **Kalman filter + re-identification** — a 4-state Kalman filter (position + velocity) smooths the MOSSE output and predicts where the target should be. When MOSSE drifts (detected by comparing its output to the Kalman prediction), the tracker:
+   - Re-seats MOSSE at the Kalman-predicted position (if the gap exceeds 15 px)
+   - If the target is fully lost, enters recovery mode and searches for the target using template matching (NCC) against a gallery of recent appearance patches
+   - The Kalman velocity decays while the target is lost, preventing runaway predictions
+
+### Alignment tool
+
+Use this if you want to visually inspect and manually tune the camera alignment. For automated calibration, use `calibrate` instead.
 
 **Controls:**
 - `A` — auto-align (grid search on current frame)
 - `M` — multi-frame align (samples 5 frames, more robust)
-- `S` — print the alignment parameters (copy-paste into tracker code)
+- `S` — print the alignment parameters
 - `N`/`P` — next / previous frame
 - Sliders — manual fine-tuning of scale and offset
 - `Q` — quit
@@ -85,42 +138,19 @@ Use this if the event camera overlay doesn't line up with the RGB frame. It show
 ./align <data.h5> [--side left|right] [--time <seconds>]
 ```
 
-## How the tracker works
-
-The MOSSE tracker runs on RGB frames at ~25fps. Between frames, we use events from the Prophesee camera to estimate optical flow inside the tracked bounding box:
-
-1. **Time-surface**: We maintain a map of when each pixel last fired an event
-2. **Plane fitting**: For each event inside the bbox, we fit a plane to the local 5×5 neighborhood of the time-surface. The gradient of this plane tells us the local flow direction
-3. **Normal flow**: From the time-surface gradient (a, b), the optical flow is v = -∇T / |∇T|²
-4. **Averaging + smoothing**: Per-event flows are averaged over the bbox and smoothed with an EMA across frames
-
-The event-predicted bounding box (yellow) shows where the target is likely heading. The flow arrow shows the dominant motion direction.
-
-## Camera calibration
-
-The two cameras have different intrinsics. The event-to-RGB mapping is:
-
-```
-u_evt = 0.816 * u_rgb + 100.0
-v_evt = 0.816 * v_rgb + 64.1
-```
-
-These come from the intrinsic parameters in the H5 file:
-- **Prophesee left**: fx=1034.86, fy=1033.48, cx=629.70, cy=357.60
-- **OVC RGB**: fx=1268.56, fy=1267.35, cx=649.37, cy=359.94
-
-If you're using different data, run the `align` tool to find the correct mapping.
-
 ## Project structure
 
 ```
 src/
-  tracker_main.cpp      MOSSE + event flow tracker
-  align_main.cpp        Camera alignment tool
+  tracker_main.cpp      MOSSE + event flow + Kalman + re-ID tracker
+  calibrate_main.cpp    Offline camera calibration tool
+  align_main.cpp        Interactive camera alignment tool
+  auto_calibrate.h      Shared calibration logic (grid search, YAML I/O)
+  reidentifier.h/.cpp   Kalman filter + template gallery re-ID module
   event.h / event.cpp   Event data types + H5 reader
   rgb_reader.h / .cpp   RGB frame reader (from H5)
 data/
   *.h5                  M3ED dataset files
 build/
-  tracker, align        compiled binaries
+  tracker, calibrate, align
 ```
